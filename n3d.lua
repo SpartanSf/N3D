@@ -183,8 +183,12 @@ function Mesh.new()
     return setmetatable({vertices = {}, triangles = {}}, Mesh)
 end
 
-function Mesh:addVertex(position, normal)
-    table.insert(self.vertices, {position = position or Vector3.new(0, 0, 0), normal = normal or Vector3.new(0, 1, 0)})
+function Mesh:addVertex(position, normal, texcoord)
+    table.insert(self.vertices, {
+        position = position or Vector3.new(0, 0, 0), 
+        normal = normal or Vector3.new(0, 1, 0),
+        texcoord = texcoord or {u = 0, v = 0}
+    })
     return #self.vertices
 end
 
@@ -193,8 +197,117 @@ function Mesh:addTriangle(i1, i2, i3, material)
         v1 = self.vertices[i1], 
         v2 = self.vertices[i2], 
         v3 = self.vertices[i3],
-        material = material
+        material = material,
+        indices = {i1, i2, i3}
     })
+end
+
+function Mesh:addTriangleRaw(v1, v2, v3, material)
+
+    local i1 = self:addVertex(v1.position, v1.normal, v1.texcoord)
+    local i2 = self:addVertex(v2.position, v2.normal, v2.texcoord)
+    local i3 = self:addVertex(v3.position, v3.normal, v3.texcoord)
+    self:addTriangle(i1, i2, i3, material)
+end
+
+function Mesh:calculateNormals()
+
+    for _, vertex in ipairs(self.vertices) do
+        vertex.normal = Vector3.new(0, 0, 0)
+    end
+
+    for _, triangle in ipairs(self.triangles) do
+        local edge1 = triangle.v2.position:subtract(triangle.v1.position)
+        local edge2 = triangle.v3.position:subtract(triangle.v1.position)
+        local faceNormal = edge1:cross(edge2):normalize()
+
+        triangle.v1.normal = triangle.v1.normal:add(faceNormal)
+        triangle.v2.normal = triangle.v2.normal:add(faceNormal)
+        triangle.v3.normal = triangle.v3.normal:add(faceNormal)
+    end
+
+    for _, vertex in ipairs(self.vertices) do
+        vertex.normal = vertex.normal:normalize()
+    end
+end
+
+function Mesh.fromOBJ(objString, material, scale)
+    local mesh = Mesh.new()
+    scale = scale or 1.0
+
+    local vertices = {}
+    local normals = {}
+    local texcoords = {}
+
+    for line in objString:gmatch("[^\r\n]+") do
+        line = line:gsub("^%s+", ""):gsub("%s+$", "") 
+
+        if line:sub(1, 2) == "v " then
+
+            local x, y, z = line:match("v%s+([%-%d%.]+)%s+([%-%d%.]+)%s+([%-%d%.]+)")
+            if x and y and z then
+                table.insert(vertices, Vector3.new(tonumber(x) * scale, tonumber(y) * scale, tonumber(z) * scale))
+            end
+
+        elseif line:sub(1, 3) == "vn " then
+
+            local x, y, z = line:match("vn%s+([%-%d%.]+)%s+([%-%d%.]+)%s+([%-%d%.]+)")
+            if x and y and z then
+                table.insert(normals, Vector3.new(tonumber(x), tonumber(y), tonumber(z)))
+            end
+
+        elseif line:sub(1, 3) == "vt " then
+
+            local u, v = line:match("vt%s+([%-%d%.]+)%s+([%-%d%.]+)")
+            if u and v then
+                table.insert(texcoords, {u = tonumber(u), v = tonumber(v)})
+            end
+
+        elseif line:sub(1, 2) == "f " then
+
+            local faceVertices = {}
+
+            for vertexData in line:gmatch("%S+") do
+                if vertexData ~= "f" then
+                    local parts = {}
+                    for part in vertexData:gmatch("[^%/]+") do
+                        table.insert(parts, part)
+                    end
+
+                    local vi, ti, ni
+
+                    if #parts == 1 then
+                        vi = parts[1]
+                    elseif #parts == 2 then
+                        vi, ni = parts[1], parts[2]
+                    else
+                        vi, ti, ni = parts[1], parts[2], parts[3]
+                    end
+
+                    if vi then
+                        local vertex = {
+                            position = vertices[tonumber(vi)],
+                            normal = ni and normals[tonumber(ni)] or Vector3.new(0, 1, 0),
+                            texcoord = ti and texcoords[tonumber(ti)] or {u = 0, v = 0}
+                        }
+                        table.insert(faceVertices, vertex)
+                    end
+                end
+            end
+
+            if #faceVertices >= 3 then
+                for i = 2, #faceVertices - 1 do
+                    mesh:addTriangleRaw(faceVertices[1], faceVertices[i], faceVertices[i + 1], material)
+                end
+            end
+        end
+    end
+
+    if #normals == 0 then
+        mesh:calculateNormals()
+    end
+
+    return mesh
 end
 
 function Mesh.cube(size, material)
@@ -425,6 +538,146 @@ function Scene:setCamera(camera)
     self.camera = camera
 end
 
+TriangleRenderer = {}
+TriangleRenderer.__index = TriangleRenderer
+
+function TriangleRenderer.new()
+    return setmetatable({
+        zBuffer = {},
+        initialized = false
+    }, TriangleRenderer)
+end
+
+function TriangleRenderer:initZBuffer()
+
+    if not self.zBuffer then
+        self.zBuffer = {}
+    end
+
+    for y = 1, SCREEN_HEIGHT do
+        if not self.zBuffer[y] then
+            self.zBuffer[y] = {}
+        end
+        for x = 1, SCREEN_WIDTH do
+            if not self.zBuffer[y][x] then
+                self.zBuffer[y][x] = 100.0
+            end
+        end
+    end
+    self.initialized = true
+end
+
+function TriangleRenderer:clearZBuffer()
+
+    self:initZBuffer()
+    for y = 1, SCREEN_HEIGHT do
+        for x = 1, SCREEN_WIDTH do
+            self.zBuffer[y][x] = 100.0
+        end
+    end
+end
+
+function TriangleRenderer:drawTriangle(v1, v2, v3, material, lights, camera)
+    self:initZBuffer()
+
+    local function simpleProject(vertex)
+        local viewMatrix, projMatrix = camera:updateMatrices(SCREEN_WIDTH / SCREEN_HEIGHT)
+
+        local viewPos = viewMatrix:transformVector(vertex.position)
+        if viewPos.z >= -0.1 then return nil end
+
+        local projPos = projMatrix:transformVector(viewPos)
+        if projPos.z == 0 then return nil end
+
+        local ndcX, ndcY = projPos.x / projPos.z, projPos.y / projPos.z
+        local screenX = math.floor(SCREEN_CENTER_X + ndcX * SCREEN_CENTER_X)
+        local screenY = math.floor(SCREEN_CENTER_Y - ndcY * SCREEN_CENTER_Y)
+
+        return {
+            x = clamp(screenX, 0, SCREEN_WIDTH - 1),
+            y = clamp(screenY, 0, SCREEN_HEIGHT - 1),
+            z = -viewPos.z
+        }
+    end
+
+    local p1 = simpleProject(v1)
+    local p2 = simpleProject(v2)
+    local p3 = simpleProject(v3)
+
+    if not (p1 and p2 and p3) then return end
+
+    local edge1 = v2.position:subtract(v1.position)
+    local edge2 = v3.position:subtract(v1.position)
+    local normal = edge1:cross(edge2):normalize()
+
+    local center = Vector3.new(
+        (v1.position.x + v2.position.x + v3.position.x) / 3,
+        (v1.position.y + v2.position.y + v3.position.z) / 3,
+        (v1.position.z + v2.position.z + v3.position.z) / 3
+    )
+
+    local viewDir = camera.position:subtract(center):normalize()
+
+    local color = {r = 128, g = 128, b = 128}
+    if material then
+        color = material.diffuse
+
+        if lights and #lights > 0 then
+            for _, light in ipairs(lights) do
+                if light.type == "directional" then
+                    local lightDir = light.direction:multiply(-1):normalize()
+                    local diff = math.max(normal:dot(lightDir), 0.0)
+
+                    color.r = clamp(math.floor(color.r * diff * light.intensity), 0, 255)
+                    color.g = clamp(math.floor(color.g * diff * light.intensity), 0, 255)
+                    color.b = clamp(math.floor(color.b * diff * light.intensity), 0, 255)
+                    break
+                end
+            end
+        end
+    end
+
+    local points = {p1, p2, p3}
+    table.sort(points, function(a, b) return a.y < b.y end)
+    local top, mid, bot = points[1], points[2], points[3]
+
+    screen.setColor(color.r, color.g, color.b)
+
+    local function interpY(y, a, b)
+        if b.y == a.y then return {x = a.x, z = a.z} end
+        local t = (y - a.y) / (b.y - a.y)
+        return {x = lerp(a.x, b.x, t), z = lerp(a.z, b.z, t)}
+    end
+
+    local function drawSpan(y, left, right)
+        if left.x > right.x then left, right = right, left end
+        local startX = math.max(0, math.floor(left.x))
+        local endX = math.min(SCREEN_WIDTH - 1, math.floor(right.x))
+
+        for x = startX, endX do
+            local t = (right.x > left.x) and ((x - left.x) / (right.x - left.x)) or 0
+            local depth = lerp(left.z, right.z, t)
+
+            if depth < self.zBuffer[y + 1][x + 1] then
+                self.zBuffer[y + 1][x + 1] = depth
+                screen.drawPixel(x, y)
+            end
+        end
+    end
+
+    for y = math.max(0, top.y), math.min(SCREEN_HEIGHT - 1, mid.y) do
+        local left = interpY(y, top, bot)
+        local right = interpY(y, top, mid)
+        drawSpan(y, left, right)
+    end
+
+    for y = math.max(0, mid.y + 1), math.min(SCREEN_HEIGHT - 1, bot.y) do
+        local left = interpY(y, top, bot)
+        local right = interpY(y, mid, bot)
+        drawSpan(y, left, right)
+    end
+end
+
 ShadowSystem = {}
 ShadowSystem.__index = ShadowSystem
 
@@ -641,6 +894,7 @@ function Renderer.new()
         scene = nil,
         zBuffer = {},
         shadowSystem = ShadowSystem.new(),
+        triangleRenderer = TriangleRenderer.new(),
         mode = "filled", 
         stats = {trianglesRendered = 0, framesRendered = 0, fps = 0}
     }, Renderer)
@@ -663,6 +917,12 @@ function Renderer:setMode(mode)
     self.mode = mode
 end
 
+function Renderer:drawTriangle(v1, v2, v3, material)
+    local lights = self.scene and self.scene.lights or {}
+    local camera = self.scene and self.scene.camera or Camera.new()
+    self.triangleRenderer:drawTriangle(v1, v2, v3, material, lights, camera)
+end
+
 function Renderer:clearScreen(color)
     color = color or {r = 0, g = 0, b = 0}
     screen.setColor(color.r, color.g, color.b)
@@ -675,6 +935,7 @@ function Renderer:clearZBuffer()
             self.zBuffer[y][x] = 100.0 
         end
     end
+    self.triangleRenderer:clearZBuffer()
 end
 
 function Renderer:projectVertex(worldPos, worldNormal, viewMatrix, projMatrix)
@@ -1145,114 +1406,157 @@ function Renderer:render()
 
     self.stats.framesRendered = self.stats.framesRendered + 1
 
-    screen.setColor(255, 255, 255)
     screen.draw()
 
     return trianglesRendered
 end
 
+local sampleOBJ = [[
+v -0.5 -0.5 -0.5
+v  0.5 -0.5 -0.5
+v  0.5  0.5 -0.5
+v -0.5  0.5 -0.5
+v -0.5 -0.5  0.5
+v  0.5 -0.5  0.5
+v  0.5  0.5  0.5
+v -0.5  0.5  0.5
 
--- demo
+f 5 6 7
+f 5 7 8
+
+f 1 4 3
+f 1 3 2
+
+f 1 5 8
+f 1 8 4
+
+f 2 3 7
+f 2 7 6
+
+f 4 8 7
+f 4 7 3
+
+f 1 2 6
+f 1 6 5
+]]
 
 local materials = {
-	redPlastic = Material.new(
-		{r = 200, g = 50, b = 50},
-		{r = 255, g = 255, b = 255},
-		128.0,
-		{r = 50, g = 10, b = 10}
-	),
-	emerald = Material.new(
-		{r = 80, g = 200, b = 120},
-		{r = 255, g = 255, b = 255},
-		76.8,
-		{r = 5, g = 20, b = 5},
-		{r = 0, g = 10, b = 0}
-	),
-	floor = Material.new(
-		{r = 120, g = 120, b = 130},
-		{r = 50, g = 50, b = 50},
-		16.0,
-		{r = 40, g = 40, b = 45}
-	),
-	gold = Material.new(
-		{r = 255, g = 215, b = 0},
-		{r = 255, g = 255, b = 255},
-		51.2,
-		{r = 75, g = 60, b = 0}
-	)
+    redPlastic = Material.new(
+        {r = 200, g = 50, b = 50},
+        {r = 255, g = 255, b = 255},
+        128.0,
+        {r = 50, g = 10, b = 10}
+    ),
+    emerald = Material.new(
+        {r = 80, g = 200, b = 120},
+        {r = 255, g = 255, b = 255},
+        76.8,
+        {r = 5, g = 20, b = 5},
+        {r = 0, g = 10, b = 0}
+    ),
+    floor = Material.new(
+        {r = 120, g = 120, b = 130},
+        {r = 50, g = 50, b = 50},
+        16.0,
+        {r = 40, g = 40, b = 45}
+    ),
+    gold = Material.new(
+        {r = 255, g = 215, b = 0},
+        {r = 255, g = 255, b = 255},
+        51.2,
+        {r = 75, g = 60, b = 0}
+    ),
+    objMaterial = Material.new(
+        {r = 150, g = 100, b = 200},
+        {r = 255, g = 255, b = 255},
+        64.0,
+        {r = 30, g = 20, b = 40}
+    )
 }
 
 local scene = Scene.new()
 
 local cube = SceneObject.new(
-	Mesh.cube(1.5, materials.redPlastic),
-	materials.redPlastic,
-	Vector3.new(-2.5, 1, 0),
-	Vector3.new(0, 0, 0),
-	Vector3.new(1, 1, 1),
-	true,  
-	false  
+    Mesh.cube(1.5, materials.redPlastic),
+    materials.redPlastic,
+    Vector3.new(-3, 1, 0),
+    Vector3.new(0, 0, 0),
+    Vector3.new(1, 1, 1),
+    true,  
+    false  
 )
 
 local sphere = SceneObject.new(
-	Mesh.sphere(1.2, 20, materials.emerald),
-	materials.emerald,
-	Vector3.new(2.5, 0.5, 0),
-	Vector3.new(0, 0, 0),
-	Vector3.new(1, 1, 1),
-	true,  
-	false  
+    Mesh.sphere(1.2, 20, materials.emerald),
+    materials.emerald,
+    Vector3.new(3, 0.5, 0),
+    Vector3.new(0, 0, 0),
+    Vector3.new(1, 1, 1),
+    true,  
+    false  
+)
+
+local objMesh = Mesh.fromOBJ(sampleOBJ, materials.objMaterial, 1.2)
+local objObject = SceneObject.new(
+    objMesh,
+    materials.objMaterial,
+    Vector3.new(0, 2, 1),
+    Vector3.new(0, 0, 0),
+    Vector3.new(1, 1, 1),
+    true,
+    false
 )
 
 local smallSphere = SceneObject.new(
-	Mesh.sphere(0.6, 12, materials.gold),
-	materials.gold,
-	Vector3.new(0, 2.5, -1),
-	Vector3.new(0, 0, 0),
-	Vector3.new(1, 1, 1),
-	true,  
-	false  
+    Mesh.sphere(0.6, 12, materials.gold),
+    materials.gold,
+    Vector3.new(0, 2.5, -1),
+    Vector3.new(0, 0, 0),
+    Vector3.new(1, 1, 1),
+    true,  
+    false  
 )
 
 local floor = SceneObject.new(
-	Mesh.plane(25, -3, materials.floor),
-	materials.floor,
-	Vector3.new(0, -3, 0),
-	Vector3.new(0, 0, 0),
-	Vector3.new(1, 1, 1),
-	false, 
-	true   
+    Mesh.plane(25, -3, materials.floor),
+    materials.floor,
+    Vector3.new(0, -3, 0),
+    Vector3.new(0, 0, 0),
+    Vector3.new(1, 1, 1),
+    false, 
+    true   
 )
 
-scene:addObject(floor)  
+scene:addObject(floor)
 scene:addObject(cube)
 scene:addObject(sphere)
+scene:addObject(objObject)
 scene:addObject(smallSphere)
 
 local primaryLight = Light.directional(
-	Vector3.new(0.3, -1, 0.4),
-	{r = 255, g = 250, b = 235},
-	1.8
+    Vector3.new(0.3, -1, 0.4),
+    {r = 255, g = 250, b = 235},
+    1.8
 )
 
 local fillLight = Light.point(
-	Vector3.new(-3, 4, 3),
-	{r = 200, g = 220, b = 255},
-	1.2,
-	15
+    Vector3.new(-3, 4, 3),
+    {r = 200, g = 220, b = 255},
+    1.2,
+    15
 )
 
 local rimLight = Light.spot(
-	Vector3.new(4, 3, -2),
-	Vector3.new(-1, -0.5, 0.5),
-	{r = 255, g = 200, b = 150},
-	1.0,
-	25, 35, 12
+    Vector3.new(4, 3, -2),
+    Vector3.new(-1, -0.5, 0.5),
+    {r = 255, g = 200, b = 150},
+    1.0,
+    25, 35, 12
 )
 
 local ambientLight = Light.ambient(
-	{r = 40, g = 45, b = 60},
-	7.5
+    {r = 40, g = 45, b = 60},
+    7.5
 )
 
 scene:addLight(primaryLight)
@@ -1269,75 +1573,64 @@ renderer:setMode("pixel_lighting")
 
 local rotation = Vector3.new(0, 0, 0)
 local lightAnimation = 0
-
-local demo = {
-	scene = scene,
-	renderer = renderer,
-	cube = cube,
-	sphere = sphere,
-	smallSphere = smallSphere,
-	floor = floor,
-	fillLight = fillLight,
-	rimLight = rimLight,
-	materials = materials,
-	rotation = rotation,
-	lightAnimation = lightAnimation,
-	stats = {frames = 0, lastTime = chip.getTime(), fps = 0}
- }
-
 local frameCount = 0
 local lastFpsUpdate = chip.getTime()
+local stats = {frames = 0, lastTime = chip.getTime(), fps = 0}
 
 while true do
     local currentTime = chip.getTime()
-    local deltaTime = (currentTime - demo.stats.lastTime) / 1000.0
+    local deltaTime = (currentTime - stats.lastTime) / 1000.0
 
     if currentTime - lastFpsUpdate >= 1000 then
-        demo.stats.fps = frameCount
+        stats.fps = frameCount
         frameCount = 0
         lastFpsUpdate = currentTime
     end
 
-    if currentTime - demo.stats.lastTime >= 16 then 
-        demo.rotation.x = demo.rotation.x + deltaTime * 0.4
-        demo.rotation.y = demo.rotation.y + deltaTime * 0.6
-        demo.rotation.z = demo.rotation.z + deltaTime * 0.2
+    if currentTime - stats.lastTime >= 16 then 
+        rotation.x = rotation.x + deltaTime * 0.4
+        rotation.y = rotation.y + deltaTime * 0.6
+        rotation.z = rotation.z + deltaTime * 0.2
 
-        demo.lightAnimation = demo.lightAnimation + deltaTime
+        lightAnimation = lightAnimation + deltaTime
 
-        demo.cube:setRotation(demo.rotation.x, demo.rotation.y, demo.rotation.z)
-        demo.sphere:setRotation(demo.rotation.x * 0.5, demo.rotation.y * 1.2, demo.rotation.z * 0.8)
-        demo.smallSphere:setRotation(demo.rotation.x * 1.5, demo.rotation.y * 0.7, demo.rotation.z * 1.3)
+        cube:setRotation(rotation.x, rotation.y, rotation.z)
+        sphere:setRotation(rotation.x * 0.5, rotation.y * 1.2, rotation.z * 0.8)
+        objObject:setRotation(rotation.x * 0.8, rotation.y * 1.5, rotation.z * 0.3)
+        smallSphere:setRotation(rotation.x * 1.5, rotation.y * 0.7, rotation.z * 1.3)
 
-        if demo.fillLight then
-            demo.fillLight.position.x = -3 + 2 * math.sin(demo.lightAnimation * 0.3)
-            demo.fillLight.position.z = 3 + 1.5 * math.cos(demo.lightAnimation * 0.4)
+        if fillLight then
+            fillLight.position.x = -3 + 2 * math.sin(lightAnimation * 0.3)
+            fillLight.position.z = 3 + 1.5 * math.cos(lightAnimation * 0.4)
         end
 
-        if demo.rimLight then
-            demo.rimLight.position.y = 3 + 1 * math.sin(demo.lightAnimation * 0.5)
+        if rimLight then
+            rimLight.position.y = 3 + 1 * math.sin(lightAnimation * 0.5)
 
-            local angle = demo.lightAnimation * 0.2
-            demo.rimLight.position.x = 4 * math.cos(angle)
-            demo.rimLight.position.z = -2 + 2 * math.sin(angle)
+            local angle = lightAnimation * 0.2
+            rimLight.position.x = 4 * math.cos(angle)
+            rimLight.position.z = -2 + 2 * math.sin(angle)
 
             local center = Vector3.new(0, 0, 0)
-            local newDir = center:subtract(demo.rimLight.position):normalize()
-            demo.rimLight.direction = newDir
+            local newDir = center:subtract(rimLight.position):normalize()
+            rimLight.direction = newDir
         end
 
-        demo.smallSphere:setPosition(
-            1.5 * math.sin(demo.lightAnimation * 0.8),
-            2.5 + 0.5 * math.sin(demo.lightAnimation * 1.2),
-            -1 + 0.8 * math.cos(demo.lightAnimation * 0.6)
+        smallSphere:setPosition(
+            1.5 * math.sin(lightAnimation * 0.8),
+            2.5 + 0.5 * math.sin(lightAnimation * 1.2),
+            -1 + 0.8 * math.cos(lightAnimation * 0.6)
         )
 
-        demo.renderer:render()
+        renderer:render()
+        screen.setColor(255, 0, 0)
+        screen.drawPixel(1, 1)
+        screen.draw()
 
         frameCount = frameCount + 1
-        demo.stats.lastTime = currentTime
+        stats.lastTime = currentTime
 
-        screen.setColor(255, 255, 255)
-        screen.draw()
+        local t = chip.getTime()
+        while true do if (t/1000) + 3 <= (chip.getTime()/1000) then break end end
     end
 end
